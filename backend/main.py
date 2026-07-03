@@ -384,8 +384,7 @@ def reclaim_stale_jobs(stale_after_minutes: int = 2, db: Session = Depends(get_d
     holding a claimed job, that job would otherwise sit stuck forever. This
     sweep finds jobs claimed by workers whose heartbeat has gone silent for
     longer than `stale_after_minutes` and returns them to the queue so a
-    healthy worker can pick them up. Intended to run on a schedule (cron /
-    external scheduler) or be called periodically by an ops process.
+    healthy worker can pick them up.
     """
     sql = text("""
         UPDATE jobs
@@ -412,15 +411,18 @@ def ai_incident_report(lookback: int = 20, db: Session = Depends(get_db)):
     doesn't have to manually scan error logs to spot patterns. Uses Gemini
     if GEMINI_API_KEY is set; otherwise falls back to a rule-based summary
     so this endpoint never breaks even without an API key configured.
+
+    NOTE: all columns are explicitly qualified with their table name in the
+    SELECT below. This is required because both `jobs` and `job_executions`
+    have a `status` column — without qualifying it, PostgreSQL raises
+    "column reference status is ambiguous" once a LEFT JOIN brings both
+    tables into scope.
     """
     import os
-    # NOTE: jobs and job_executions both have a `status` column, and
-    # `error_message` lives only on job_executions, so every selected
-    # column is explicitly qualified with its table name below to avoid
-    # a psycopg2.errors.AmbiguousColumn error.
     rows = db.execute(text("""
-        SELECT jobs.job_type, jobs.status, job_executions.error_message,
-               jobs.attempt_count, jobs.created_at
+        SELECT jobs.job_type AS job_type, jobs.status AS status,
+               job_executions.error_message AS error_message,
+               jobs.attempt_count AS attempt_count, jobs.created_at AS created_at
         FROM jobs LEFT JOIN job_executions ON job_executions.job_id = jobs.id
         WHERE jobs.status IN ('failed', 'dead_letter')
         ORDER BY jobs.updated_at DESC LIMIT :n
