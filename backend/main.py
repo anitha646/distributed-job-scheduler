@@ -404,6 +404,66 @@ def reclaim_stale_jobs(stale_after_minutes: int = 2, db: Session = Depends(get_d
     return {"reclaimed_count": len(rows), "job_ids": [str(r.id) for r in rows]}
 
 
+@app.post("/admin/ai-incident-report")
+def ai_incident_report(lookback: int = 20, db: Session = Depends(get_db)):
+    """
+    AI-assisted operations feature: analyzes recent failed and dead-lettered
+    jobs and produces a plain-English root-cause summary, so an operator
+    doesn't have to manually scan error logs to spot patterns. Uses Gemini
+    if GEMINI_API_KEY is set; otherwise falls back to a rule-based summary
+    so this endpoint never breaks even without an API key configured.
+    """
+    import os
+    # NOTE: jobs and job_executions both have a `status` column, and
+    # `error_message` lives only on job_executions, so every selected
+    # column is explicitly qualified with its table name below to avoid
+    # a psycopg2.errors.AmbiguousColumn error.
+    rows = db.execute(text("""
+        SELECT jobs.job_type, jobs.status, job_executions.error_message,
+               jobs.attempt_count, jobs.created_at
+        FROM jobs LEFT JOIN job_executions ON job_executions.job_id = jobs.id
+        WHERE jobs.status IN ('failed', 'dead_letter')
+        ORDER BY jobs.updated_at DESC LIMIT :n
+    """), {"n": lookback}).fetchall()
+
+    if not rows:
+        return {"summary": "No recent failures found. System is healthy.",
+                "analyzed_count": 0, "source": "rule_based"}
+
+    by_type = {}
+    for r in rows:
+        by_type.setdefault(r.job_type, {"count": 0, "errors": []})
+        by_type[r.job_type]["count"] += 1
+        if r.error_message:
+            by_type[r.job_type]["errors"].append(r.error_message[:200])
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key:
+        try:
+            import requests as req_lib
+            prompt = ("You are an SRE assistant. Given this summary of recent job failures "
+                       f"grouped by job type: {by_type}. In 3-4 sentences, identify likely "
+                       "root causes and give one concrete recommendation. Be concise.")
+            resp = req_lib.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}",
+                json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=8
+            )
+            if resp.ok:
+                text_out = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                return {"summary": text_out.strip(), "analyzed_count": len(rows), "source": "gemini"}
+        except Exception as e:
+            logger.warning(f"AI incident report fell back to rule-based: {e}")
+
+    # Rule-based fallback — always works, no API key required
+    lines = []
+    for jt, data in sorted(by_type.items(), key=lambda x: -x[1]["count"]):
+        lines.append(f"{data['count']} failure(s) in '{jt}' jobs.")
+    summary = " ".join(lines) + " Review error messages per job type for root cause; " \
+              "consider increasing max_attempts or adding circuit breakers for the " \
+              "most frequent failing job type."
+    return {"summary": summary, "analyzed_count": len(rows), "source": "rule_based"}
+
+
 @app.get("/dashboard/summary")
 def dashboard_summary(db: Session = Depends(get_db)):
     rows = db.execute(text("SELECT status, COUNT(*) AS count FROM jobs GROUP BY status")).fetchall()
