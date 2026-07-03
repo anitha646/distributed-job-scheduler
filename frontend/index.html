@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Scheduler Console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg: #0b0f10;
+    --panel: #12181a;
+    --panel-border: #212b2d;
+    --text: #e7ede9;
+    --text-dim: #7d8f8b;
+    --accent: #5eead4;   /* signal teal — "healthy" */
+    --warn: #f5c04a;
+    --danger: #f0654f;
+    --mono: 'JetBrains Mono', monospace;
+    --sans: 'Inter', sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:var(--sans); }
+  #root { padding: 28px 32px; max-width: 1200px; margin: 0 auto; }
+
+  .topbar { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:24px; border-bottom:1px solid var(--panel-border); padding-bottom:16px;}
+  .topbar h1 { font-family: var(--mono); font-size:18px; font-weight:700; letter-spacing:0.5px; margin:0; }
+  .topbar .sub { color:var(--text-dim); font-size:12px; font-family:var(--mono); }
+  .pulse { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--accent); margin-right:6px; box-shadow: 0 0 8px var(--accent); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
+
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(140px,1fr)); gap:12px; margin-bottom:28px; }
+  .stat { background:var(--panel); border:1px solid var(--panel-border); border-radius:8px; padding:14px 16px; }
+  .stat .n { font-family:var(--mono); font-size:26px; font-weight:700; }
+  .stat .l { font-size:11px; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.6px; margin-top:2px;}
+  .stat.queued .n{color:var(--text);} .stat.running .n{color:var(--accent);}
+  .stat.completed .n{color:#7fd88f;} .stat.failed .n{color:var(--danger);} .stat.dead_letter .n{color:var(--warn);}
+
+  .panel { background:var(--panel); border:1px solid var(--panel-border); border-radius:10px; margin-bottom:20px; overflow:hidden; }
+  .panel-head { padding:12px 16px; border-bottom:1px solid var(--panel-border); font-size:12px; text-transform:uppercase; letter-spacing:0.6px; color:var(--text-dim); font-family:var(--mono); display:flex; justify-content:space-between; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; padding:8px 16px; color:var(--text-dim); font-weight:500; font-size:11px; text-transform:uppercase; border-bottom:1px solid var(--panel-border);}
+  td { padding:9px 16px; border-bottom:1px solid #1a2224; font-family:var(--mono); }
+  tr:last-child td { border-bottom:none; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:20px; font-size:11px; font-family:var(--mono); }
+  .badge.queued{background:#2a3436;color:#9db3ae;} .badge.claimed{background:#2a3350;color:#9fb0f0;}
+  .badge.running{background:#123c38;color:var(--accent);} .badge.completed{background:#173a24;color:#7fd88f;}
+  .badge.failed{background:#3c1f1a;color:var(--danger);} .badge.dead_letter{background:#3c2e12;color:var(--warn);}
+  .retry-btn { background:transparent; border:1px solid var(--panel-border); color:var(--text-dim); font-family:var(--mono); font-size:11px; padding:3px 10px; border-radius:5px; cursor:pointer; }
+  .retry-btn:hover { border-color:var(--accent); color:var(--accent); }
+  .empty { padding:32px; text-align:center; color:var(--text-dim); font-family:var(--mono); font-size:13px; }
+  .conn-note { font-family: var(--mono); font-size: 12px; color: var(--text-dim); background: var(--panel); border: 1px dashed var(--panel-border); padding: 10px 14px; border-radius: 8px; margin-bottom: 20px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect } = React;
+const API_BASE = window.SCHEDULER_API_BASE || "http://localhost:8000";
+
+function timeAgo(iso) {
+  if (!iso) return "—";
+  const s = Math.floor((Date.now() - new Date(iso)) / 1000);
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s/60) + "m ago";
+  return Math.floor(s/3600) + "h ago";
+}
+
+function StatCard({ label, value, cls }) {
+  return (
+    <div className={"stat " + cls}>
+      <div className="n">{value ?? 0}</div>
+      <div className="l">{label}</div>
+    </div>
+  );
+}
+
+function App() {
+  const [summary, setSummary] = useState({});
+  const [jobs, setJobs] = useState([]);
+  const [workers, setWorkers] = useState([]);
+  const [connected, setConnected] = useState(false);
+  const [token, setToken] = useState(localStorage_stub());
+
+  function localStorage_stub(){ return null; } // artifacts can't use localStorage; token lives in memory only
+
+  async function poll() {
+    try {
+      const headers = token ? { Authorization: `Bearer ${token}` } : {};
+      const [s, j, w] = await Promise.all([
+        fetch(`${API_BASE}/dashboard/summary`, { headers }).then(r => r.ok ? r.json() : {}),
+        fetch(`${API_BASE}/jobs?page_size=15`, { headers }).then(r => r.ok ? r.json() : { items: [] }),
+        fetch(`${API_BASE}/workers`, { headers }).then(r => r.ok ? r.json() : []),
+      ]);
+      setSummary(s.job_status_breakdown || {});
+      setJobs(j.items || []);
+      setWorkers(w || []);
+      setConnected(true);
+    } catch (e) {
+      setConnected(false);
+    }
+  }
+
+  useEffect(() => {
+    poll();
+    const id = setInterval(poll, 3000); // live updates via polling
+    return () => clearInterval(id);
+  }, [token]);
+
+  async function retryJob(id) {
+    await fetch(`${API_BASE}/jobs/${id}/retry`, { method: "POST" });
+    poll();
+  }
+
+  const statuses = ["queued","claimed","running","completed","failed","dead_letter"];
+
+  return (
+    <React.Fragment>
+      <div className="topbar">
+        <div>
+          <h1>SCHEDULER CONSOLE</h1>
+          <div className="sub"><span className="pulse"></span>{connected ? "live · polling every 3s" : "disconnected"}</div>
+        </div>
+        <div className="sub">{new Date().toUTCString()}</div>
+      </div>
+
+      {!connected && (
+        <div className="conn-note">
+          Not connected to {API_BASE}. Start the backend (see README) — this UI is already wired to it,
+          nothing to change here.
+        </div>
+      )}
+
+      <div className="grid">
+        {statuses.map(s => (
+          <StatCard key={s} label={s.replace("_"," ")} value={summary[s]} cls={s} />
+        ))}
+      </div>
+
+      <div className="panel">
+        <div className="panel-head"><span>Workers</span><span>{workers.length} registered</span></div>
+        {workers.length === 0 ? <div className="empty">No workers online</div> : (
+          <table>
+            <thead><tr><th>Host</th><th>Status</th><th>Last Heartbeat</th></tr></thead>
+            <tbody>
+              {workers.map(w => (
+                <tr key={w.id}>
+                  <td>{w.hostname}</td>
+                  <td><span className={"badge " + (w.status === "online" ? "running" : "failed")}>{w.status}</span></td>
+                  <td>{timeAgo(w.last_heartbeat)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="panel">
+        <div className="panel-head"><span>Job Explorer</span><span>most recent 15</span></div>
+        {jobs.length === 0 ? <div className="empty">No jobs yet — submit one via POST /jobs</div> : (
+          <table>
+            <thead><tr><th>Type</th><th>Queue</th><th>Status</th><th>Attempts</th><th>Created</th><th></th></tr></thead>
+            <tbody>
+              {jobs.map(j => (
+                <tr key={j.id}>
+                  <td>{j.job_type}</td>
+                  <td>{j.queue_id?.slice(0,8)}</td>
+                  <td><span className={"badge " + j.status}>{j.status}</span></td>
+                  <td>{j.attempt_count}/{j.max_attempts}</td>
+                  <td>{timeAgo(j.created_at)}</td>
+                  <td>
+                    {(j.status === "failed" || j.status === "dead_letter") &&
+                      <button className="retry-btn" onClick={() => retryJob(j.id)}>retry</button>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </React.Fragment>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
